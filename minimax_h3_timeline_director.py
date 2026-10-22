@@ -774,7 +774,14 @@ def _load_image(path: Path, target_width: Any = None, target_height: Any = None)
         image = ImageOps.exif_transpose(raw).convert("RGB")
         target_size = _target_size(target_width, target_height)
         if target_size:
-            image = _fit_image(image, target_size)
+            # Reference pictures describe identity, so retain the entire image
+            # even when its aspect ratio differs from the generated video.
+            pixel_budget = target_size[0] * target_size[1]
+            scale = min(1.0, math.sqrt(pixel_budget / (image.width * image.height)))
+            if scale < 1.0:
+                width = max(1, min(int(image.width * scale), pixel_budget))
+                height = max(1, min(int(image.height * scale), pixel_budget // width))
+                image = image.resize((width, height), Image.Resampling.LANCZOS)
         arr = np.asarray(image, dtype=np.float32) / 255.0
     return torch.from_numpy(np.ascontiguousarray(arr)).unsqueeze(0)
 
@@ -1436,6 +1443,10 @@ def _execute_h3_independent_first(
     for image in (ref_images or {}).values():
         if image is None:
             continue
+        pixel_budget = width * height
+        multiple = h3_nodes.CANVAS_MULTIPLE
+        if pixel_budget < multiple * multiple:
+            raise ValueError("MiniMax H3 reference images require a pixel budget of at least 1024 (32x32)")
         image_height, image_width = image.shape[1], image.shape[2]
         if ref_image_size == "match":
             scale = min(1.0, math.sqrt((width * height) / (image_width * image_height)))
@@ -1449,6 +1460,15 @@ def _execute_h3_independent_first(
             h3_nodes.CANVAS_MULTIPLE,
             round(image_height * scale / h3_nodes.CANVAS_MULTIPLE) * h3_nodes.CANVAS_MULTIPLE,
         )
+        # The minimum 32px axis can inflate very thin references after native
+        # rounding. Keep the final VAE input inside the same pixel-area budget.
+        if target_width * target_height > pixel_budget:
+            fit_scale = min(
+                math.sqrt(pixel_budget / (target_width * target_height)),
+                pixel_budget / (multiple * max(target_width, target_height)),
+            )
+            target_width = max(multiple, math.floor(target_width * fit_scale / multiple) * multiple)
+            target_height = max(multiple, math.floor(target_height * fit_scale / multiple) * multiple)
         resized = h3_nodes._resize(image[:1], target_width, target_height, "disabled")
         encoded = vae.encode(resized)
         ref_items.append({"type": "image", "data": resized})

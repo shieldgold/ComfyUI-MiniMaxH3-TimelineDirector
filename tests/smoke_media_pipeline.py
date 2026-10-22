@@ -37,11 +37,111 @@ def load_plugin(plugin_dir: Path):
     return sys.modules[f"{package_name}.minimax_h3_timeline_director"]
 
 
+def check_reference_image_content(backend) -> None:
+    """Portrait identity references must retain the head, feet, and corners."""
+    from PIL import Image, ImageDraw
+
+    source = Image.new("RGB", (341, 765), (64, 64, 64))
+    draw = ImageDraw.Draw(source)
+    colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0)]
+    for box, color in zip(
+        [(0, 0, 63, 63), (277, 0, 340, 63), (0, 701, 63, 764), (277, 701, 340, 764)],
+        colors,
+    ):
+        draw.rectangle(box, fill=color)
+
+    with tempfile.TemporaryDirectory(prefix="m3td_reference_image_") as temporary:
+        for label, image in (
+            ("portrait", source),
+            ("landscape", source.transpose(Image.Transpose.TRANSPOSE)),
+        ):
+            path = Path(temporary) / f"{label}.png"
+            image.save(path)
+            for width, height in ((640, 544), (704, 384), (704, 576), (160, 128)):
+                loaded = backend._load_image(path, width, height)
+                pixels = loaded[0]
+                corners = (pixels[0, 0], pixels[0, -1], pixels[-1, 0], pixels[-1, -1])
+                expected = colors if label == "portrait" else [colors[i] for i in (0, 2, 1, 3)]
+                for index, (actual, color) in enumerate(zip(corners, expected)):
+                    assert torch.allclose(actual, torch.tensor(color) / 255.0), (
+                        f"{label} reference corner {index} was cropped for {width}x{height}; "
+                        "the complete head/feet identity reference must survive"
+                    )
+                actual_height, actual_width = pixels.shape[:2]
+                assert actual_width <= image.width and actual_height <= image.height, "references must not be enlarged"
+                assert actual_width * actual_height <= width * height, "reference pixel area exceeds its budget"
+                assert abs(actual_width * image.height - actual_height * image.width) <= max(image.size), (
+                    "reference aspect ratio changed by more than one output pixel"
+                )
+                if image.width * image.height <= width * height:
+                    assert (actual_width, actual_height) == image.size, "small references must retain their original size"
+
+
+def check_encoded_reference_image_budget(backend) -> None:
+    """The native 32px grid must not inflate thin reference VAE inputs."""
+    class CapturedImage(Exception):
+        pass
+
+    class CaptureVae:
+        @staticmethod
+        def encode(image):
+            raise CapturedImage(tuple(image.shape))
+
+    cases = (
+        (1, 16384, 640, 544, None),
+        (16384, 1, 640, 544, None),
+        (2160, 3840, 640, 544, None),
+        (341, 765, 640, 544, (352, 768)),
+        (341, 765, 704, 384, (352, 768)),
+        (341, 765, 704, 576, (352, 768)),
+        (1, 16384, 32, 32, (32, 32)),
+        (16384, 1, 32, 32, (32, 32)),
+        (32, 32, 32, 32, (32, 32)),
+    )
+    for mode in ("match", "max"):
+        for image_width, image_height, width, height, expected in cases:
+            image = torch.zeros((1, 1, 1, 3)).expand(1, image_height, image_width, 3)
+            try:
+                backend._execute_h3_independent_first(
+                    clip=None, vae=CaptureVae(), audio_vae=None, prompt="",
+                    width=width, height=height, length=124, ref_image_size=mode,
+                    ref_images={"ref_image_0": image}, ref_videos={},
+                    ref_video_audios={}, ref_audios={},
+                )
+            except CapturedImage as captured:
+                shape = captured.args[0]
+            else:
+                raise AssertionError("reference image did not reach the native resize/VAE path")
+            encoded_height, encoded_width = shape[1:3]
+            assert encoded_width * encoded_height <= width * height, (
+                f"{mode} reference {image_width}x{image_height} reached the VAE at "
+                f"{encoded_width}x{encoded_height}, above the {width}x{height} pixel budget"
+            )
+            assert encoded_width % 32 == encoded_height % 32 == 0
+            assert min(encoded_width, encoded_height) >= 32
+            if expected is not None:
+                assert (encoded_width, encoded_height) == expected, "ordinary reference sizing changed"
+
+    try:
+        backend._execute_h3_independent_first(
+            clip=None, vae=CaptureVae(), audio_vae=None, prompt="",
+            width=16, height=16, length=124, ref_image_size="match",
+            ref_images={"ref_image_0": torch.zeros((1, 32, 32, 3))},
+            ref_videos={}, ref_video_audios={}, ref_audios={},
+        )
+    except ValueError as error:
+        assert "1024" in str(error)
+    else:
+        raise AssertionError("reference pixel budgets smaller than one 32x32 cell must be rejected")
+
+
 def main() -> None:
     if len(sys.argv) != 4:
         raise SystemExit("usage: smoke_media_pipeline.py VIDEO IMAGE AUDIO")
     plugin_dir = Path(__file__).resolve().parents[1]
     backend = load_plugin(plugin_dir)
+    check_reference_image_content(backend)
+    check_encoded_reference_image_budget(backend)
     backend.MiniMaxH3TimelinePlanner.define_schema()
     backend.MiniMaxH3OmniPromptBridge.define_schema()
     backend.MiniMaxH3TimelineEncoder.define_schema()
@@ -85,8 +185,8 @@ def main() -> None:
         "images": [{"file": image}],
         "audios": [{"file": audio, "trimStart": 0.0, "duration": 3.0}],
     }
-    # Reference media must be bounded to the node generation canvas before it
-    # reaches the official H3 VAE path (protects against 4K/8K uploads).
+    # Reference video keeps its selected canvas; independent pictures keep
+    # their full contents within the generation pixel-area budget.
     target_width, target_height = 320, 192
     assert backend._reference_size({}, target_width, target_height) == (320, 192)
     assert backend._reference_size(
@@ -102,7 +202,11 @@ def main() -> None:
     assert torch.allclose(images["ref_image_0"], expected_picture_1), "independent image must be Picture 1"
     assert len(videos) == 1, "only the cyan-range intersection may become a Video ref"
     assert videos["ref_video_0"].shape == (120, 160, 256, 3)
-    assert all(image.shape == (1, target_height, target_width, 3) for image in images.values())
+    assert all(
+        image.shape[0] == 1 and image.shape[-1] == 3
+        and image.shape[1] * image.shape[2] <= target_width * target_height
+        for image in images.values()
+    )
     assert len(paired_audio) == 1
     assert guides[0]["frame_idx"] == 0
     assert sum(g["image"].shape[0] for g in guides) == 120
@@ -124,7 +228,8 @@ def main() -> None:
         (2.0, 5.0)
     ]
     prompt_pictures, prompt_videos, prompt_audios, prompt_video_audios = backend._plan_prompt_media(plan)
-    assert len(prompt_pictures) == 1 and prompt_pictures[0].shape == (1, 192, 320, 3)
+    assert len(prompt_pictures) == 1
+    assert prompt_pictures[0].shape[1] * prompt_pictures[0].shape[2] <= 192 * 320
     assert [tuple(round(v, 3) for v in video.get_active_trim_window()) for video in prompt_videos] == [
         (2.0, 5.0)
     ]

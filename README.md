@@ -100,7 +100,7 @@ An editable reference-media timeline for ComfyUI's native **MiniMax H3 Reference
   latent locking and unchanged source-audio assembly.
 - Stable `<Picture N>`, `<Video N>`, and `<Audio N>` ordering from UI to H3 inputs.
 - Global and per-segment prompts: the global prompt is reused only when all segment prompts are empty; entering any segment prompt requires completing every segment and disables the global prompt.
-- Decode-time resizing to the node's `width × height` for VRAM protection.
+- Independent reference images retain their full contents and aspect ratio when loaded, with downscaling only. Native H3 grid alignment also stays within the node's `width × height` pixel-area budget. Videos keep their selected reference canvas for VRAM protection.
 - Built-in two-stage sampling for every segment, including native low-resolution tail carry, learned H3 latent lifting, and high-resolution Drift-Control continuation; `comfyui-SelfLift` is not required.
 - In both one-stage and two-stage reference-video generation, enabled Video Original Audio is automatically locked through the native AV path and restored as one continuous original waveform. Disabling it fixes the AV audio stream and final master to silence; an explicitly uploaded locked audio asset takes priority.
 - Segmented digital-human generation with locked source audio on the native AV mask/sigma path, preserving the soundtrack and lip-sync guidance through two-stage sampling.
